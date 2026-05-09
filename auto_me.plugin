@@ -1,0 +1,1165 @@
+"""Auto-Me 2.0 - LLM-assisted message rewriter for exteraGram.
+
+Single-file plugin (Python 3.11, Chaquopy). Provides .ai* command family,
+multiple style profiles, confirm-before-send dialogs, in-memory LRU cache,
+rate limiting, retry/backoff, statistics, import/export and Android-aware
+clipboard helpers. All blocking work runs via run_on_queue; UI callbacks
+are wrapped in try/except so the settings page survives plugin bugs.
+"""
+
+import hashlib
+import json
+import re
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import OrderedDict
+from datetime import datetime, timezone
+from typing import Any, List
+
+# === Required SDK surface (do not add extras) ===
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import run_on_queue, send_message, get_last_fragment
+from android_utils import log, run_on_ui_thread
+from ui.settings import Header, Divider, Switch, Selector, Input, Text, EditText
+
+# === Defensive optional imports (graceful degradation, never crash load) ===
+try:
+    from ui.bulletin import BulletinHelper  # type: ignore
+    _HAS_BULLETIN = True
+except Exception:
+    BulletinHelper = None  # type: ignore
+    _HAS_BULLETIN = False
+
+try:
+    from ui.alert import AlertDialogBuilder  # type: ignore
+    _HAS_ALERT = True
+except Exception:
+    AlertDialogBuilder = None  # type: ignore
+    _HAS_ALERT = False
+
+try:
+    from java import jclass  # type: ignore
+    _HAS_JCLASS = True
+except Exception:
+    jclass = None  # type: ignore
+    _HAS_JCLASS = False
+
+
+# === Plugin metadata (plain literals, no f-strings; AST-parsed) ===
+__id__ = "auto_me"
+__name__ = "Auto-Me"
+__description__ = "LLM rewriter with profiles, translation, caching and stats"
+__author__ = "@Ilyich"
+__version__ = "2.0.0"
+__icon__ = "exteraPlugins/1"
+__min_version__ = "11.12.0"
+__app_version__ = ">=12.5.1"
+__sdk_version__ = ">=1.4.3.6"
+
+
+# === Constants ===
+_HTTP_TIMEOUT = 15
+_HTTP_RETRY_DELAYS = (1.0, 2.0, 4.0)
+_HTTP_RETRY_CODES = {429, 500, 502, 503}
+
+_ANTHROPIC_DEFAULT_BASE = "https://api.anthropic.com"
+_ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5"
+_ANTHROPIC_VERSION = "2023-06-01"
+_OPENAI_DEFAULT_BASE = "https://api.openai.com"
+_OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+
+_PROVIDERS = ["anthropic", "openai", "custom"]
+_PROVIDER_LABELS = ["Anthropic", "OpenAI", "Custom (OpenAI-compatible)"]
+
+_TEMPERATURE_VALUES = [0.0, 0.3, 0.7, 1.0]
+_TEMPERATURE_LABELS = ["0.0 (deterministic)", "0.3", "0.7", "1.0 (creative)"]
+_TEMPERATURE_DEFAULT_IDX = 1
+
+_LANGUAGES = [
+    ("en", "English"), ("ru", "Russian"), ("uk", "Ukrainian"),
+    ("de", "German"), ("es", "Spanish"), ("fr", "French"),
+    ("it", "Italian"), ("pt", "Portuguese"), ("zh", "Chinese"),
+    ("ja", "Japanese"), ("ko", "Korean"), ("tr", "Turkish"),
+]
+_LANGUAGE_LABELS = [name + " (" + code + ")" for code, name in _LANGUAGES]
+
+_CACHE_MAX = 50
+_CACHE_TTL = 3600
+_MAX_INFLIGHT = 2
+_MAX_CONSEC_ERRORS = 5
+_PROFILE_COUNT = 3
+_PROFILE_MAX_SAMPLES_LEN = 4000
+_REPLY_QUOTE_LIMIT = 1000
+
+
+# === Command registry. Trigger token -> handler metadata. ===
+_COMMANDS = OrderedDict([
+    (".ai", {
+        "mode": "rewrite", "label": "Rewrite in your style",
+        "suffix": "Rewrite the user draft keeping their personal style. "
+                  "Output only the rewritten text, no commentary.",
+    }),
+    (".ait", {
+        "mode": "translate", "label": "Translate",
+        "suffix": "Translate the user draft to {lang}. Detect source "
+                  "language automatically. Output only the translation.",
+    }),
+    (".aif", {
+        "mode": "formal", "label": "Make formal",
+        "suffix": "Rewrite the user draft in a formal, professional tone. "
+                  "Output only the rewritten text.",
+    }),
+    (".aic", {
+        "mode": "concise", "label": "Make concise",
+        "suffix": "Shorten the user draft to its essential message without "
+                  "losing meaning. Output only the rewritten text.",
+    }),
+    (".aix", {
+        "mode": "expand", "label": "Develop the thought",
+        "suffix": "Expand and develop the user draft into a fuller message "
+                  "while keeping the original intent. Output only the rewritten text.",
+    }),
+    (".ai?", {
+        "mode": "qa", "label": "Q&A (no style mimicry)",
+        "suffix": "Answer the user question directly and concisely. "
+                  "Do not mimic any style. Output only the answer.",
+    }),
+    (".air", {
+        "mode": "redo", "label": "Redo last draft in this chat",
+        "suffix": "",
+    }),
+    (".aistyle", {
+        "mode": "style", "label": "Style controls (e.g. .aistyle scan)",
+        "suffix": "",
+    }),
+])
+
+_STYLE_PREAMBLE = (
+    "You are an assistant that helps the user send messages on Telegram. "
+    "Never add greetings or sign-offs unless they appear in the style samples. "
+    "Output only the final message text - no quotes, no commentary, no markdown fences."
+)
+
+
+# === Schema of user-facing keys (for import/export validation and reset) ===
+_SCHEMA_KEYS = {
+    "enabled": bool,
+    "confirm_before_send": bool,
+    "active_profile": int,
+    "profile_1_name": str,
+    "profile_1_samples": str,
+    "profile_2_name": str,
+    "profile_2_samples": str,
+    "profile_3_name": str,
+    "profile_3_samples": str,
+    "provider": int,
+    "api_key": str,
+    "custom_model": str,
+    "base_url_override": str,
+    "temperature_idx": int,
+    "max_tokens": str,
+    "translation_target": int,
+    "mask_api_key": bool,
+    "auto_disable_after_errors": bool,
+    "stop_words": str,
+    "protected_chat_ids": str,
+    "include_api_key_in_export": bool,
+    "debug_logging": bool,
+}
+
+_BOOL_DEFAULTS_TRUE = {"enabled", "mask_api_key", "auto_disable_after_errors"}
+
+
+# === Helper functions =======================================================
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _short_error(exc: BaseException) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return "HTTP " + str(exc.code)
+    if isinstance(exc, urllib.error.URLError):
+        return "network: " + str(getattr(exc, "reason", exc))[:80]
+    name = type(exc).__name__
+    msg = str(exc)
+    return (name + ": " + msg)[:140] if msg else name
+
+
+def _mask_key(key: str) -> str:
+    if not key:
+        return "(empty)"
+    if len(key) <= 7:
+        return key[:1] + "***"
+    return key[:3] + "..." + key[-4:]
+
+
+def _parse_int(value, default: int, lo=None, hi=None) -> int:
+    try:
+        v = int(str(value).strip())
+    except (TypeError, ValueError, AttributeError):
+        return default
+    if lo is not None and v < lo:
+        return default
+    if hi is not None and v > hi:
+        return default
+    return v
+
+
+def _parse_word_list(text: str) -> list:
+    if not text:
+        return []
+    parts = re.split(r"[,\n]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _contains_stopword(message: str, stop_words: list) -> str:
+    if not stop_words:
+        return ""
+    low = message.lower()
+    for w in stop_words:
+        if not w:
+            continue
+        pat = r"\b" + re.escape(w.lower()) + r"\b"
+        if re.search(pat, low):
+            return w
+    return ""
+
+
+def _default_for(key: str):
+    expected = _SCHEMA_KEYS.get(key)
+    if expected is bool:
+        return key in _BOOL_DEFAULTS_TRUE
+    if expected is int:
+        if key == "temperature_idx":
+            return _TEMPERATURE_DEFAULT_IDX
+        return 0
+    if expected is str:
+        if key == "max_tokens":
+            return "1024"
+        return ""
+    return ""
+
+
+# === LRU cache ==============================================================
+
+class _LRUCache:
+    def __init__(self, max_size: int = _CACHE_MAX, ttl: int = _CACHE_TTL):
+        self._d = OrderedDict()
+        self._max = max_size
+        self._ttl = ttl
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            row = self._d.get(key)
+            if row is None:
+                return None
+            ts, val = row
+            if time.time() - ts > self._ttl:
+                self._d.pop(key, None)
+                return None
+            self._d.move_to_end(key)
+            return val
+
+    def put(self, key, val):
+        with self._lock:
+            if key in self._d:
+                self._d.move_to_end(key)
+            self._d[key] = (time.time(), val)
+            while len(self._d) > self._max:
+                self._d.popitem(last=False)
+
+    def clear(self):
+        with self._lock:
+            self._d.clear()
+
+
+# === In-flight rate limiter =================================================
+
+class _RateLimiter:
+    def __init__(self, max_inflight: int = _MAX_INFLIGHT):
+        self._max = max_inflight
+        self._n = 0
+        self._lock = threading.Lock()
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._n >= self._max:
+                return False
+            self._n += 1
+            return True
+
+    def release(self):
+        with self._lock:
+            if self._n > 0:
+                self._n -= 1
+
+
+# === Clipboard helpers (Android via jclass; gracefully no-op without it) ====
+
+def _clipboard_set(text: str) -> bool:
+    if not _HAS_JCLASS:
+        return False
+    try:
+        ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+        Context = jclass("android.content.Context")
+        ClipData = jclass("android.content.ClipData")
+        ctx = ApplicationLoader.applicationContext
+        cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+        cm.setPrimaryClip(ClipData.newPlainText("Auto-Me", text))
+        return True
+    except Exception:
+        return False
+
+
+def _clipboard_get() -> str:
+    if not _HAS_JCLASS:
+        return ""
+    try:
+        ApplicationLoader = jclass("org.telegram.messenger.ApplicationLoader")
+        Context = jclass("android.content.Context")
+        ctx = ApplicationLoader.applicationContext
+        cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE)
+        if not cm.hasPrimaryClip():
+            return ""
+        clip = cm.getPrimaryClip()
+        if clip.getItemCount() == 0:
+            return ""
+        return str(clip.getItemAt(0).coerceToText(ctx))
+    except Exception:
+        return ""
+
+
+# === HTTP client with retry/backoff =========================================
+
+def _http_post_json(url: str, headers: dict, body: dict) -> dict:
+    payload = json.dumps(body).encode("utf-8")
+    last_exc: BaseException = RuntimeError("no attempts made")
+    delays = list(_HTTP_RETRY_DELAYS) + [None]
+    for delay in delays:
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            last_exc = e
+            if e.code in _HTTP_RETRY_CODES and delay is not None:
+                time.sleep(delay)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            last_exc = e
+            if delay is not None:
+                time.sleep(delay)
+                continue
+            raise
+    raise last_exc
+
+
+# === Provider calls =========================================================
+
+def _build_system_prompt(samples: str, mode: str, suffix: str, lang_label: str) -> str:
+    parts = [_STYLE_PREAMBLE]
+    if mode == "translate":
+        parts.append(suffix.replace("{lang}", lang_label))
+    elif suffix:
+        parts.append(suffix)
+    if samples and mode not in ("translate", "qa"):
+        parts.append("# Style samples (mimic tone, vocabulary, punctuation):\n" + samples.strip())
+    return "\n\n".join(parts)
+
+
+def _call_anthropic(api_key, base_url, model, system, user, temperature, max_tokens):
+    url = (base_url or _ANTHROPIC_DEFAULT_BASE).rstrip("/") + "/v1/messages"
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model or _ANTHROPIC_DEFAULT_MODEL,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "system": system,
+        "messages": [{"role": "user", "content": user}],
+    }
+    data = _http_post_json(url, headers, body)
+    text = data["content"][0]["text"]
+    usage = data.get("usage", {}) or {}
+    return text, int(usage.get("input_tokens", 0) or 0), int(usage.get("output_tokens", 0) or 0)
+
+
+def _call_openai_like(api_key, base_url, model, system, user, temperature, max_tokens, default_model):
+    url = (base_url or _OPENAI_DEFAULT_BASE).rstrip("/") + "/v1/chat/completions"
+    headers = {
+        "Authorization": "Bearer " + api_key,
+        "content-type": "application/json",
+    }
+    body = {
+        "model": model or default_model,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    data = _http_post_json(url, headers, body)
+    text = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {}) or {}
+    return text, int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)
+
+
+# === Plugin =================================================================
+
+class AutoMePlugin(BasePlugin):
+
+    _params_attrs_logged = False
+
+    # ---- lifecycle ---------------------------------------------------------
+
+    def on_plugin_load(self):
+        self._cache = _LRUCache()
+        self._limiter = _RateLimiter()
+        self._last_input = {}      # dialog_id -> {cmd, info, mode, arg}
+        self._consec_errors = 0
+        self._migrate_v2()
+        self.add_on_send_message_hook()
+        self.log("Auto-Me 2.0 loaded")
+
+    def _migrate_v2(self):
+        """One-shot: copy v1 style_samples to profile_1, normalise types."""
+        try:
+            if self.get_setting("_migrated_v2", False):
+                return
+            old = self.get_setting("style_samples", "") or ""
+            existing = self.get_setting("profile_1_samples", "") or ""
+            if old and not existing:
+                self.set_setting("profile_1_samples", old)
+                self.log("Migrated style_samples -> profile_1_samples")
+            if old:
+                self.set_setting("style_samples", "")
+            raw_provider = self.get_setting("provider", None)
+            if isinstance(raw_provider, str):
+                idx = {"anthropic": 0, "openai": 1, "custom": 2}.get(
+                    raw_provider.strip().lower(), 0)
+                self.set_setting("provider", idx)
+            raw_enabled = self.get_setting("enabled", None)
+            if isinstance(raw_enabled, str):
+                self.set_setting(
+                    "enabled",
+                    raw_enabled.strip().lower() in ("1", "true", "yes", "on"),
+                )
+            self.set_setting("_migrated_v2", True)
+        except Exception as e:
+            self.log("Migration error: " + repr(e))
+
+    # ---- typed setting readers ---------------------------------------------
+
+    def _read_bool(self, key, default=False):
+        v = self.get_setting(key, default)
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    def _read_int(self, key, default=0, lo=None, hi=None):
+        return _parse_int(self.get_setting(key, default), default, lo, hi)
+
+    def _read_str(self, key, default=""):
+        v = self.get_setting(key, default)
+        if isinstance(v, str):
+            return v
+        return str(v) if v is not None else ""
+
+    def _provider_name(self) -> str:
+        return _PROVIDERS[self._read_int("provider", 0, 0, len(_PROVIDERS) - 1)]
+
+    def _temperature(self) -> float:
+        idx = self._read_int("temperature_idx", _TEMPERATURE_DEFAULT_IDX,
+                             0, len(_TEMPERATURE_VALUES) - 1)
+        return _TEMPERATURE_VALUES[idx]
+
+    def _max_tokens(self) -> int:
+        return _parse_int(self._read_str("max_tokens", "1024"), 1024, 1, 32000)
+
+    def _active_profile_idx(self) -> int:
+        return self._read_int("active_profile", 0, 0, _PROFILE_COUNT - 1)
+
+    def _profile_samples(self, idx=None) -> str:
+        if idx is None:
+            idx = self._active_profile_idx()
+        return self._read_str("profile_" + str(idx + 1) + "_samples", "")
+
+    def _profile_name(self, idx) -> str:
+        n = self._read_str("profile_" + str(idx + 1) + "_name", "")
+        return n if n else "Profile " + str(idx + 1)
+
+    def _target_language(self):
+        idx = self._read_int("translation_target", 0, 0, len(_LANGUAGES) - 1)
+        return _LANGUAGES[idx]
+
+    # ---- bulletins ---------------------------------------------------------
+
+    def _bulletin(self, kind: str, text: str):
+        msg = "[Auto-Me] " + text
+        if not _HAS_BULLETIN:
+            self.log(kind + ": " + msg)
+            return
+        try:
+            if kind == "error" and hasattr(BulletinHelper, "show_error"):
+                BulletinHelper.show_error(msg)
+            elif kind == "success" and hasattr(BulletinHelper, "show_success"):
+                BulletinHelper.show_success(msg)
+            elif hasattr(BulletinHelper, "show_info"):
+                BulletinHelper.show_info(msg)
+            else:
+                self.log(kind + ": " + msg)
+        except Exception as e:
+            self.log("Bulletin failed (" + repr(e) + "): " + msg)
+
+    def _ui_bulletin(self, kind, text):
+        run_on_ui_thread(lambda: self._bulletin(kind, text))
+
+    def _debug(self, text):
+        if self._read_bool("debug_logging", False):
+            self.log("DEBUG " + text)
+
+    # ---- callback safety wrapper ------------------------------------------
+
+    def _safe(self, name, fn):
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception as e:
+                self.log("Callback " + name + " error: " + repr(e))
+        return wrapper
+
+    # =====================================================================
+    # SETTINGS UI
+    # =====================================================================
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Auto-Me"),
+            Switch(key="enabled", text="Enabled", default=True,
+                   subtext="Master switch for all .ai* commands",
+                   icon="msg_settings"),
+            Switch(key="confirm_before_send", text="Confirm before send",
+                   default=False,
+                   subtext="Preview rewritten text in a dialog before sending"),
+            Selector(key="active_profile", text="Active style profile",
+                     default=0, items=self._profile_selector_items()),
+            Text(text="Style profiles",
+                 subtext="Manage 3 named sample sets",
+                 icon="msg_user",
+                 create_sub_fragment=self._safe("profiles_page",
+                                                self._profiles_sub_page)),
+            Divider(),
+
+            Header(text="Provider"),
+            Selector(key="provider", text="LLM provider",
+                     default=0, items=_PROVIDER_LABELS,
+                     on_change=self._safe("provider_change",
+                                          self._on_provider_change)),
+            Input(key="api_key", text="API key", default="",
+                  subtext="Stored locally on device",
+                  icon="msg_edit"),
+            Text(text="Provider settings",
+                 subtext="Model, base URL, temperature, max_tokens",
+                 icon="msg_settings",
+                 create_sub_fragment=self._safe("provider_page",
+                                                self._provider_sub_page)),
+            Divider(),
+
+            Header(text="Commands"),
+            Text(text="Trigger reference",
+                 subtext=self._trigger_reference_text(),
+                 icon="msg_info"),
+            Selector(key="translation_target",
+                     text="Translation target language",
+                     default=0, items=_LANGUAGE_LABELS),
+            Divider(),
+
+            Header(text="Privacy & Safety"),
+            Switch(key="mask_api_key", text="Mask API key in logs",
+                   default=True),
+            Switch(key="auto_disable_after_errors",
+                   text="Auto-disable after 5 errors", default=True,
+                   subtext="Toggles 'Enabled' off after 5 consecutive failures"),
+            EditText(key="stop_words",
+                     hint="word, another, sensitive_term",
+                     default="", multiline=True, max_length=2000),
+            EditText(key="protected_chat_ids",
+                     hint="-1001234567890\n123456789",
+                     default="", multiline=True, max_length=2000),
+            Divider(),
+
+            Header(text="Advanced"),
+            Text(text="Statistics",
+                 subtext="Usage counters and last-used time",
+                 icon="msg_stats",
+                 create_sub_fragment=self._safe("stats_page",
+                                                self._stats_sub_page)),
+            Text(text="Export config to clipboard",
+                 subtext="JSON; api_key included only if switch below is on",
+                 icon="msg_share",
+                 on_click=self._safe("export", self._on_export)),
+            Text(text="Import config from clipboard",
+                 subtext="Reads JSON, validates against schema, applies",
+                 icon="msg_download",
+                 on_click=self._safe("import", self._on_import)),
+            Switch(key="include_api_key_in_export",
+                   text="Include API key in export", default=False),
+            Switch(key="debug_logging", text="Debug logging", default=False),
+            Divider(),
+
+            Text(text="Reset all settings",
+                 subtext="Restores defaults (asks confirmation)",
+                 icon="msg_delete", red=True,
+                 on_click=self._safe("reset_all", self._on_reset_all)),
+        ]
+
+    def _profile_selector_items(self) -> List[str]:
+        return [self._profile_name(i) for i in range(_PROFILE_COUNT)]
+
+    def _trigger_reference_text(self) -> str:
+        lines = [cmd + " - " + info["label"] for cmd, info in _COMMANDS.items()]
+        lines.append("Tip: reply to a message and start with .ai - the quoted "
+                     "text becomes context.")
+        return "\n".join(lines)
+
+    # ---- sub-pages --------------------------------------------------------
+
+    def _profiles_sub_page(self):
+        items = [Header(text="Style profiles")]
+        for i in range(_PROFILE_COUNT):
+            n = i + 1
+            items.append(Header(text="Profile " + str(n)))
+            items.append(Input(key="profile_" + str(n) + "_name",
+                               text="Name", default="Profile " + str(n)))
+            items.append(EditText(
+                key="profile_" + str(n) + "_samples",
+                hint="Paste 5-15 of your messages, one per line",
+                default="", multiline=True,
+                max_length=_PROFILE_MAX_SAMPLES_LEN))
+            items.append(Divider())
+        items.append(Text(
+            text="Auto-collect samples (.aistyle scan)",
+            subtext="Currently a stub - paste manually above. "
+                    "TODO: implement via MessagesController reflection.",
+            icon="msg_info"))
+        return items
+
+    def _provider_sub_page(self):
+        return [
+            Header(text="Provider settings"),
+            Input(key="custom_model", text="Model name (overrides default)",
+                  default="",
+                  subtext="Leave empty to use the provider default"),
+            Input(key="base_url_override", text="Base URL override",
+                  default="",
+                  subtext="For proxies; leave empty for official endpoint. "
+                          "Required for 'Custom' provider."),
+            Selector(key="temperature_idx", text="Temperature",
+                     default=_TEMPERATURE_DEFAULT_IDX,
+                     items=_TEMPERATURE_LABELS),
+            Input(key="max_tokens", text="Max tokens",
+                  default="1024", subtext="Integer 1-32000"),
+            Divider(),
+            Text(text="Defaults",
+                 subtext="Anthropic: " + _ANTHROPIC_DEFAULT_MODEL +
+                         "\nOpenAI: " + _OPENAI_DEFAULT_MODEL,
+                 icon="msg_info"),
+        ]
+
+    def _stats_sub_page(self):
+        total = self._read_int("_stats_total_requests", 0)
+        ok = self._read_int("_stats_success", 0)
+        fail = self._read_int("_stats_fail", 0)
+        in_tok = self._read_int("_stats_total_input_tokens", 0)
+        out_tok = self._read_int("_stats_total_output_tokens", 0)
+        last = self._read_str("_stats_last_used_iso", "(never)") or "(never)"
+        rate = (100.0 * ok / total) if total else 0.0
+        return [
+            Header(text="Statistics"),
+            Text(text="Total requests", subtext=str(total)),
+            Text(text="Successful",
+                 subtext=str(ok) + " (" + format(rate, ".1f") + "%)"),
+            Text(text="Failed", subtext=str(fail)),
+            Text(text="Input tokens", subtext=str(in_tok)),
+            Text(text="Output tokens", subtext=str(out_tok)),
+            Text(text="Last used", subtext=last),
+            Divider(),
+            Text(text="Reset statistics", red=True,
+                 on_click=self._safe("reset_stats", self._on_reset_stats)),
+        ]
+
+    # ---- callbacks --------------------------------------------------------
+
+    def _on_provider_change(self, *args):
+        self._debug("provider changed; clearing cache")
+        self._cache.clear()
+
+    def _on_export(self, *args):
+        cfg = {}
+        include_key = self._read_bool("include_api_key_in_export", False)
+        for k in _SCHEMA_KEYS:
+            if k == "api_key" and not include_key:
+                continue
+            cfg[k] = self.get_setting(k, _default_for(k))
+        cfg["__plugin__"] = "auto_me"
+        cfg["__version__"] = __version__
+        try:
+            dumped = json.dumps(cfg, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._bulletin("error", "Export failed: " + repr(e))
+            return
+        if _clipboard_set(dumped):
+            self._bulletin("success", "Config copied to clipboard")
+        else:
+            self.log("Export (clipboard unavailable):\n" + dumped)
+            self._bulletin("error", "Clipboard unavailable; payload in logs")
+
+    def _on_import(self, *args):
+        raw = _clipboard_get()
+        if not raw:
+            self._bulletin("error", "Clipboard is empty or unavailable")
+            return
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            self._bulletin("error", "Clipboard is not valid JSON: " + _short_error(e))
+            return
+        if not isinstance(data, dict):
+            self._bulletin("error", "Import payload must be a JSON object")
+            return
+        if data.get("__plugin__") not in (None, "auto_me"):
+            self._bulletin("error", "Payload is not an Auto-Me config")
+            return
+        sanitized = self._sanitize_import(data)
+        if not sanitized:
+            self._bulletin("error", "No recognised keys in payload")
+            return
+        try:
+            self.import_settings(sanitized, reload_settings=True)
+        except Exception as e:
+            self.log("import_settings failed (" + repr(e) + "); falling back to per-key set")
+            for k, v in sanitized.items():
+                try:
+                    self.set_setting(k, v)
+                except Exception as ee:
+                    self.log("set_setting " + k + " failed: " + repr(ee))
+        self._bulletin("success", "Imported " + str(len(sanitized)) + " keys")
+
+    def _sanitize_import(self, data: dict) -> dict:
+        out = {}
+        for k, expected in _SCHEMA_KEYS.items():
+            if k not in data:
+                continue
+            v = data[k]
+            if expected is bool:
+                if isinstance(v, bool):
+                    out[k] = v
+                elif isinstance(v, str):
+                    out[k] = v.strip().lower() in ("1", "true", "yes", "on")
+            elif expected is int:
+                try:
+                    out[k] = int(v)
+                except (TypeError, ValueError):
+                    pass
+            elif expected is str:
+                if isinstance(v, str):
+                    out[k] = v
+                elif v is None:
+                    pass
+                else:
+                    out[k] = str(v)
+        return out
+
+    def _on_reset_stats(self, *args):
+        def do_reset():
+            for k in ("_stats_total_requests", "_stats_success", "_stats_fail",
+                      "_stats_total_input_tokens", "_stats_total_output_tokens"):
+                try:
+                    self.set_setting(k, 0)
+                except Exception as e:
+                    self.log("reset stat " + k + " failed: " + repr(e))
+            try:
+                self.set_setting("_stats_last_used_iso", "")
+            except Exception:
+                pass
+            self._bulletin("success", "Statistics reset")
+        self._confirm("Reset statistics?", "All counters will be zeroed.", do_reset)
+
+    def _on_reset_all(self, *args):
+        def do_reset():
+            for k in list(_SCHEMA_KEYS.keys()):
+                try:
+                    self.set_setting(k, _default_for(k))
+                except Exception as e:
+                    self.log("reset " + k + " failed: " + repr(e))
+            self._consec_errors = 0
+            self._cache.clear()
+            self._bulletin("success", "All settings reset to defaults")
+        self._confirm("Reset all settings?",
+                      "API key, profiles, and preferences will be cleared.",
+                      do_reset)
+
+    # ---- alerts -----------------------------------------------------------
+
+    def _get_activity(self):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return None
+            return frag.getParentActivity()
+        except Exception as e:
+            self.log("get_last_fragment failed: " + repr(e))
+            return None
+
+    def _confirm(self, title: str, message: str, on_yes):
+        def show():
+            if not _HAS_ALERT:
+                self.log("AlertDialogBuilder unavailable; auto-confirming: " + title)
+                self._safe("confirm_yes", on_yes)()
+                return
+            try:
+                ctx = self._get_activity()
+                if ctx is None:
+                    raise RuntimeError("no activity")
+                b = AlertDialogBuilder(ctx)
+                b.set_title(title)
+                b.set_message(message)
+                b.set_positive_button("OK", lambda d, w: self._safe("confirm_yes", on_yes)())
+                b.set_negative_button("Cancel", lambda d, w: None)
+                b.show()
+            except Exception as e:
+                self.log("confirm dialog failed (" + repr(e) + "); auto-confirming")
+                self._safe("confirm_yes_fallback", on_yes)()
+        run_on_ui_thread(show)
+
+    def _confirm_send(self, dialog_id, rewritten: str, regen_cb):
+        def show():
+            if not _HAS_ALERT:
+                self.log("AlertDialogBuilder unavailable; sending without confirm")
+                self._send_to_chat(dialog_id, rewritten)
+                return
+            try:
+                ctx = self._get_activity()
+                if ctx is None:
+                    raise RuntimeError("no activity")
+                b = AlertDialogBuilder(ctx)
+                b.set_title("Auto-Me preview")
+                b.set_message(rewritten)
+                b.set_positive_button(
+                    "Send",
+                    lambda d, w: self._safe(
+                        "confirm_send",
+                        lambda: self._send_to_chat(dialog_id, rewritten))())
+                b.set_neutral_button(
+                    "Regenerate",
+                    lambda d, w: self._safe("regen", regen_cb)())
+                b.set_negative_button("Cancel", lambda d, w: None)
+                b.show()
+            except Exception as e:
+                self.log("confirm-send dialog failed (" + repr(e) + "); sending raw")
+                self._send_to_chat(dialog_id, rewritten)
+        run_on_ui_thread(show)
+
+    # ---- send-to-chat (multi-signature defensive wrapper) ----------------
+
+    def _send_to_chat(self, dialog_id, text: str):
+        if dialog_id is None:
+            self.log("no dialog_id; dropping: " + text[:80])
+            return
+
+        def _do():
+            attempts = (
+                lambda: send_message({"peer": dialog_id, "message": text}),
+                lambda: send_message(peer=dialog_id, message=text),
+                lambda: send_message(dialog_id, text),
+            )
+            last_err = None
+            for fn in attempts:
+                try:
+                    fn()
+                    return
+                except TypeError as e:
+                    last_err = e
+                    continue
+                except Exception as e:
+                    self.log("send_message failed: " + repr(e))
+                    return
+            self.log("all send_message signatures failed: " + repr(last_err))
+
+        run_on_ui_thread(_do)
+
+    # ---- statistics & error tracking -------------------------------------
+
+    def _stats_record(self, ok: bool, in_tok: int = 0, out_tok: int = 0):
+        try:
+            self.set_setting("_stats_total_requests",
+                             self._read_int("_stats_total_requests", 0) + 1)
+            if ok:
+                self.set_setting("_stats_success",
+                                 self._read_int("_stats_success", 0) + 1)
+            else:
+                self.set_setting("_stats_fail",
+                                 self._read_int("_stats_fail", 0) + 1)
+            if in_tok:
+                self.set_setting("_stats_total_input_tokens",
+                                 self._read_int("_stats_total_input_tokens", 0) + in_tok)
+            if out_tok:
+                self.set_setting("_stats_total_output_tokens",
+                                 self._read_int("_stats_total_output_tokens", 0) + out_tok)
+            self.set_setting("_stats_last_used_iso", _now_iso())
+        except Exception as e:
+            self.log("stats update failed: " + repr(e))
+
+    def _bump_consec_errors(self):
+        self._consec_errors += 1
+        if (self._consec_errors >= _MAX_CONSEC_ERRORS
+                and self._read_bool("auto_disable_after_errors", True)):
+            try:
+                self.set_setting("enabled", False)
+            except Exception as e:
+                self.log("auto-disable failed: " + repr(e))
+            self._ui_bulletin(
+                "error",
+                "Disabled after " + str(_MAX_CONSEC_ERRORS) +
+                " consecutive errors. Re-enable in settings.")
+            self._consec_errors = 0
+
+    # =====================================================================
+    # HOOK
+    # =====================================================================
+
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        message = getattr(params, "message", None)
+        if not isinstance(message, str):
+            return HookResult()
+
+        stripped = message.lstrip()
+        if not stripped or not stripped.startswith(".ai"):
+            return HookResult()
+
+        parts = stripped.split(None, 1)
+        cmd = parts[0]
+        if cmd not in _COMMANDS:
+            return HookResult()
+        arg = parts[1] if len(parts) > 1 else ""
+
+        if not AutoMePlugin._params_attrs_logged:
+            try:
+                attrs = [a for a in dir(params) if not a.startswith("_")]
+                self.log("params attrs: " + ", ".join(attrs))
+            except Exception as e:
+                self.log("dir(params) failed: " + repr(e))
+            AutoMePlugin._params_attrs_logged = True
+
+        dialog_id = self._extract_dialog_id(params)
+
+        if dialog_id is not None and self._is_protected(dialog_id):
+            self._debug("protected chat " + str(dialog_id) + "; ignoring")
+            return HookResult()
+
+        if not self._read_bool("enabled", True):
+            params.message = "Auto-Me is disabled. Toggle it on in plugin settings."
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        info = _COMMANDS[cmd]
+        mode = info["mode"]
+
+        if mode == "style":
+            return self._handle_style_command(params, arg)
+
+        if mode == "redo":
+            cached = self._last_input.get(dialog_id)
+            if not cached:
+                params.message = "Auto-Me: nothing to redo in this chat yet."
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            cmd, info = cached["cmd"], cached["info"]
+            mode, arg = cached["mode"], cached["arg"]
+
+        if mode != "redo" and not arg:
+            params.message = "Usage: " + cmd + " <text>"
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        prompt = arg
+        reply_text = self._extract_reply_text(params)
+        if reply_text:
+            prompt = ("Quoted message:\n" + reply_text +
+                      "\n\nMy draft:\n" + arg)
+
+        stop_words = _parse_word_list(self._read_str("stop_words", ""))
+        hit = _contains_stopword(prompt, stop_words)
+        if hit:
+            self._ui_bulletin("error", "Blocked by stop word: " + hit)
+            return HookResult()
+
+        api_key = self._read_str("api_key", "").strip()
+        if not api_key:
+            params.message = "Auto-Me: API key is not set. Open plugin settings."
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        if not self._limiter.try_acquire():
+            self._ui_bulletin("info", "Auto-Me busy, try again in a moment")
+            return HookResult()
+
+        # Cache last raw input so .air can re-run it.
+        self._last_input[dialog_id] = {
+            "cmd": cmd, "info": info, "mode": mode, "arg": arg,
+        }
+
+        ctx = {
+            "dialog_id": dialog_id,
+            "mode": mode,
+            "info": info,
+            "prompt": prompt,
+            "api_key": api_key,
+            "confirm": self._read_bool("confirm_before_send", False),
+            "temperature": self._temperature(),
+        }
+        run_on_queue(lambda: self._worker(ctx))
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    # ---- hook helpers ----------------------------------------------------
+
+    def _extract_dialog_id(self, params):
+        for attr in ("peer", "dialog_id", "peer_id"):
+            v = getattr(params, attr, None)
+            if v is not None:
+                return v
+        return None
+
+    def _extract_reply_text(self, params) -> str:
+        # Reply context shape varies between SDK builds; best-effort getattr.
+        for attr in ("reply_to_msg", "replyToMsg", "reply_message",
+                     "quoted_text", "reply_to"):
+            v = getattr(params, attr, None)
+            if v is None:
+                continue
+            text = (getattr(v, "message", None)
+                    or getattr(v, "text", None)
+                    or (v if isinstance(v, str) else None))
+            if isinstance(text, str) and text:
+                return text[:_REPLY_QUOTE_LIMIT]
+        return ""
+
+    def _is_protected(self, dialog_id) -> bool:
+        ids = _parse_word_list(self._read_str("protected_chat_ids", ""))
+        return str(dialog_id) in ids
+
+    def _handle_style_command(self, params, arg) -> HookResult:
+        sub = (arg or "").strip().split(None, 1)
+        sub_cmd = sub[0].lower() if sub else ""
+        if sub_cmd == "scan":
+            # TODO: implement outgoing-message scan via MessagesController.
+            # The Java surface for fetching the user's last N outgoing messages
+            # in this SDK build is undocumented; leaving a stub. The user can
+            # paste samples manually via Settings -> Style profiles.
+            self._ui_bulletin(
+                "info",
+                "Sample scan is not implemented yet. "
+                "Paste samples in Settings -> Style profiles.")
+            return HookResult()
+        params.message = (
+            "Usage: .aistyle scan  (collects last ~50 outgoing messages; "
+            "currently a stub - paste samples manually in Settings)")
+        return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+    # =====================================================================
+    # WORKER (runs on run_on_queue thread, never on UI)
+    # =====================================================================
+
+    def _worker(self, ctx, attempt: int = 1):
+        dialog_id = ctx["dialog_id"]
+        mode = ctx["mode"]
+        info = ctx["info"]
+        prompt = ctx["prompt"]
+        api_key = ctx["api_key"]
+        confirm = ctx["confirm"]
+        temperature = ctx["temperature"]
+
+        in_tok = out_tok = 0
+        try:
+            samples = self._profile_samples()
+            lang_code, lang_name = self._target_language()
+            lang_label = lang_name + " (" + lang_code + ")"
+            system_prompt = _build_system_prompt(
+                samples, mode, info["suffix"], lang_label)
+            profile_idx = self._active_profile_idx()
+            cache_key = (mode, profile_idx,
+                         _sha(system_prompt + "||" + prompt + "||" + str(temperature)))
+
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                self._debug("cache hit mode=" + mode)
+                rewritten = cached
+            else:
+                provider = self._provider_name()
+                model = self._read_str("custom_model", "").strip()
+                base_url = self._read_str("base_url_override", "").strip()
+                max_tokens = self._max_tokens()
+                masked = (_mask_key(api_key)
+                          if self._read_bool("mask_api_key", True) else api_key)
+                self._debug("LLM call provider=" + provider +
+                            " model=" + (model or "(default)") +
+                            " key=" + masked + " attempt=" + str(attempt) +
+                            " temp=" + str(temperature))
+                if provider == "openai":
+                    rewritten, in_tok, out_tok = _call_openai_like(
+                        api_key, base_url, model, system_prompt, prompt,
+                        temperature, max_tokens, _OPENAI_DEFAULT_MODEL)
+                elif provider == "custom":
+                    if not base_url:
+                        raise ValueError(
+                            "custom provider requires Base URL override")
+                    rewritten, in_tok, out_tok = _call_openai_like(
+                        api_key, base_url, model, system_prompt, prompt,
+                        temperature, max_tokens,
+                        model or _OPENAI_DEFAULT_MODEL)
+                else:
+                    rewritten, in_tok, out_tok = _call_anthropic(
+                        api_key, base_url, model, system_prompt, prompt,
+                        temperature, max_tokens)
+
+                if not isinstance(rewritten, str) or not rewritten.strip():
+                    raise ValueError("empty LLM response")
+                rewritten = rewritten.strip()
+                self._cache.put(cache_key, rewritten)
+
+            self._stats_record(ok=True, in_tok=in_tok, out_tok=out_tok)
+            self._consec_errors = 0
+
+            if confirm:
+                regen_ctx = dict(ctx)
+                regen_ctx["temperature"] = min(1.0, temperature + 0.2)
+
+                def _regen():
+                    self._ui_bulletin("info", "Regenerating...")
+                    if not self._limiter.try_acquire():
+                        self._ui_bulletin("info", "Auto-Me busy, try again")
+                        return
+                    run_on_queue(lambda: self._worker(regen_ctx))
+
+                self._confirm_send(dialog_id, rewritten, _regen)
+            else:
+                self._send_to_chat(dialog_id, rewritten)
+        except Exception as e:
+            self.log("worker error attempt=" + str(attempt) + ": " + repr(e))
+            self._stats_record(ok=False, in_tok=in_tok, out_tok=out_tok)
+            self._bump_consec_errors()
+            self._send_to_chat(
+                dialog_id,
+                "\u26a0\ufe0f Auto-Me error: " + _short_error(e))
+        finally:
+            self._limiter.release()
